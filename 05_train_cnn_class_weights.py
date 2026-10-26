@@ -1,268 +1,160 @@
+from pathlib import Path
+
 import numpy as np
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers, models, regularizers
-from tensorflow.keras.optimizers import Adam
-import seaborn as sns
 import matplotlib.pyplot as plt
-from sklearn.utils.class_weight import compute_class_weight
-from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
-# Function to load and parse TFRecord dataset
-def load_tfdataset(filename):
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.losses import BinaryFocalCrossentropy
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    average_precision_score,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+)
+
+# ---------------------------------------------------------------------
+# Configuration and reproducibility
+# ---------------------------------------------------------------------
+
+SEED = 42
+keras.utils.set_random_seed(SEED)
+
+# Request deterministic operations where supported.
+try:
+    tf.config.experimental.enable_op_determinism()
+except (AttributeError, RuntimeError) as exc:
+    print(f"Could not enable deterministic operations: {exc}")
+
+# Dataset and output directories.
+# Environment variables allow the paths to be changed outside Kaggle.
+
+
+DATASET_DIR = Path(
+    os.environ.get(
+        "PARKING_DATASET_DIR",
+        "/kaggle/input/datasets/hajar20/my-data",
+    )
+)
+OUTPUT_DIR = Path(
+    os.environ.get("PARKING_OUTPUT_DIR", "/kaggle/working")
+)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Model and training configuration.
+IMAGE_SHAPE = (128, 128, 3)
+BATCH_SIZE = 32
+EPOCHS = 20
+AUTOTUNE = tf.data.AUTOTUNE
+
+
+# ---------------------------------------------------------------------
+# TFRecord loading and parsing
+# ---------------------------------------------------------------------
+
+def load_tfrecord_dataset(filename):
+    """Load and parse a TFRecord file containing images and labels."""
+
+    filepath = DATASET_DIR / filename
+
+    if not filepath.is_file():
+        raise FileNotFoundError(
+            f"TFRecord file not found: {filepath}"
+        )
+
+    feature_description = {
+        "image": tf.io.FixedLenFeature([], tf.string),
+        "label": tf.io.FixedLenFeature([], tf.int64),
+    }
+
     def parse_example(example_proto):
-        # Define the expected features in the TFRecord
-        feature_description = {
-            'image': tf.io.FixedLenFeature([], tf.string),
-            'label': tf.io.FixedLenFeature([], tf.int64)
-        }
-        # Parse a single example
-        parsed = tf.io.parse_single_example(example_proto, feature_description)
-        # Deserialize the image tensor
-        image = tf.io.parse_tensor(parsed['image'], tf.float32)
-        image = tf.reshape(image, (128, 128, 3))  # Reshape to expected image size
-        label = tf.cast(parsed['label'], tf.int32)  # Cast label to int32 for training
+        """Decode one serialized image and its binary label."""
+
+        parsed = tf.io.parse_single_example(
+            example_proto,
+            feature_description,
+        )
+
+        image = tf.io.parse_tensor(
+            parsed["image"],
+            out_type=tf.float32,
+        )
+        image = tf.ensure_shape(image, IMAGE_SHAPE)
+
+        label = tf.cast(parsed["label"], tf.int32)
+
+        # Ensure labels follow the expected binary classification scheme.
+        tf.debugging.assert_greater_equal(label, 0)
+        tf.debugging.assert_less_equal(label, 1)
+
         return image, label
-    
-    # Load the TFRecord file and apply parsing function in parallel
-    dataset = tf.data.TFRecordDataset(f'/kaggle/input/updated-prepro-data/{filename}')
-    dataset = dataset.map(parse_example, num_parallel_calls=tf.data.AUTOTUNE)
+
+    dataset = tf.data.TFRecordDataset(str(filepath))
+
+    dataset = dataset.map(
+        parse_example,
+        num_parallel_calls=AUTOTUNE,
+    )
+
     return dataset
 
-# Constants for dataset pipeline
-AUTOTUNE = tf.data.AUTOTUNE
-BATCH_SIZE = 32
+# ---------------------------------------------------------------------
+# Load dataset splits
+# ---------------------------------------------------------------------
 
-# Load datasets for training, validation, and testing
-raw_train = load_tfdataset('train.tfrecord')
-raw_valid = load_tfdataset('valid.tfrecord')
-raw_test = load_tfdataset('test.tfrecord')
+# Load the preprocessed training, validation, and test datasets.
+train_dataset = load_tfrecord_dataset("train.tfrecord")
+valid_dataset = load_tfrecord_dataset("valid.tfrecord")
+test_dataset = load_tfrecord_dataset("test.tfrecord")
 
-# Helper function to count examples in a dataset
-def count_examples(dataset):
-    count = 0
-    for _ in dataset:  # Iterate over dataset to count elements
-        count += 1
-    return count
+print("All three TFRecord datasets loaded successfully.")
 
-# Count and print the number of examples in each dataset
-train_example_count = count_examples(raw_train)
-print(f"Examples in train data: {train_example_count}")
+# ---------------------------------------------------------------------
+# Dataset inspection and validation
+# ---------------------------------------------------------------------
 
-valid_example_count = count_examples(raw_valid)
-print(f"Examples in valid data: {valid_example_count}")
+def inspect_dataset(dataset, name):
+    """Count examples and validate image shapes and binary labels."""
 
-test_example_count = count_examples(raw_test)
-print(f"Examples in test data: {test_example_count}")
+    total = 0
+    class_counts = {0: 0, 1: 0}
+    first_batch_shape = None
 
-# Function to count number of samples per class in the dataset
-def count_classes(dataset, num_classes=2):
-    """Count the number of samples per class in a dataset"""
-    class_counts = [0] * num_classes
-    for _, label in dataset:
-        class_counts[label.numpy()] += 1
-    return class_counts
+    for images, labels in dataset.batch(BATCH_SIZE):
 
-# Compute class distribution for train, validation, and test datasets
-train_class_counts = count_classes(raw_train)
-valid_class_counts = count_classes(raw_valid)
-test_class_counts = count_classes(raw_test)
+        if first_batch_shape is None:
+            first_batch_shape = tuple(images.shape)
 
-print("\nTrain data class distribution:")
-for i, count in enumerate(train_class_counts):
-    print(f"Class {i} samples: {count}")
+        # Validate the image dimensions.
+        if tuple(images.shape[1:]) != IMAGE_SHAPE:
+            raise ValueError(
+                f"{name} contains images with unexpected shape: "
+                f"{images.shape[1:]}; expected {IMAGE_SHAPE}."
+            )
 
-print("\nValidation data class distribution:")
-for i, count in enumerate(valid_class_counts):
-    print(f"Class {i} samples: {count}")
+        labels_np = labels.numpy()
 
-print("\nTest data class distribution:")
-for i, count in enumerate(test_class_counts):
-    print(f"Class {i} samples: {count}")
+        # Ensure labels belong to the expected binary classes.
+        invalid_labels = set(np.unique(labels_np)) - {0, 1}
 
-# Compute class weights to address class imbalance using sklearn's balanced strategy
-def compute_sklearn_class_weights(class_counts):
-    # Create label array matching distribution of classes
-    labels = []
-    for class_idx, count in enumerate(class_counts):
-        labels.extend([class_idx] * count)
-    
-    # Compute weights automatically balancing the classes
-    classes = np.unique(labels)
-    weights = compute_class_weight('balanced', classes=classes, y=labels)
-    
-    # Return as a dictionary mapping class index to weight (for Keras training)
-    return {i: w for i, w in zip(classes, weights)}
+        if invalid_labels:
+            raise ValueError(
+                f"{name} contains invalid labels: {invalid_labels}"
+            )
 
-# Calculate class weights from training data
-class_weight_dict = compute_sklearn_class_weights(train_class_counts)
-print("\nClass weights:", class_weight_dict)
+        total += len(labels_np)
+        class_counts[0] += int(np.sum(labels_np == 0))
+        class_counts[1] += int(np.sum(labels_np == 1))
 
-# Prepare datasets for training with batching, shuffling, caching and prefetching
-train_dataset = (
-    raw_train
-    .cache()
-    .shuffle(1000)
-    .batch(BATCH_SIZE)
-    .prefetch(AUTOTUNE)
-)
+    if total == 0:
+        raise ValueError(f"{name} dataset is empty.")
 
-valid_dataset = (
-    raw_valid
-    .cache()
-    .batch(BATCH_SIZE)
-    .prefetch(AUTOTUNE)
-)
-
-test_dataset = (
-    raw_test
-    .cache()
-    .batch(BATCH_SIZE)
-    .prefetch(AUTOTUNE)
-)
-
-# Build the CNN model
-model = tf.keras.Sequential([
-    tf.keras.layers.Input(shape=(128, 128, 3)),
-    
-    tf.keras.layers.Conv2D(32, (3, 3), activation='relu'),
-    tf.keras.layers.BatchNormalization(),
-    tf.keras.layers.MaxPooling2D((2, 2)),
-    tf.keras.layers.Dropout(0.2),
-    
-    tf.keras.layers.Conv2D(64, (3, 3), activation='relu'),
-    tf.keras.layers.BatchNormalization(),
-    tf.keras.layers.MaxPooling2D((2, 2)),
-    tf.keras.layers.Dropout(0.2),
-    
-    tf.keras.layers.Flatten(),
-    
-    tf.keras.layers.Dense(128, activation='relu'),
-
-    tf.keras.layers.Dense(1, activation='sigmoid')  # Binary classification output
-])
-
-model.summary()
-
-# Compile the model with AdamW optimizer and Binary Focal Crossentropy loss, including key metrics
-model.compile(
-    optimizer=tf.keras.optimizers.AdamW(learning_rate=0.0002, weight_decay=1e-5, global_clipnorm=5.0),
-    loss=tf.keras.losses.BinaryFocalCrossentropy(gamma=2),
-    metrics=[
-        tf.keras.metrics.BinaryAccuracy(name='accuracy'),
-        tf.keras.metrics.Precision(name='precision'),
-        tf.keras.metrics.Recall(name='recall'),
-        tf.keras.metrics.AUC(name='auc_roc'),
-        tf.keras.metrics.AUC(name='auc_pr')
-    ]
-)
-
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
-import os
-
-# Callbacks to improve training and save best models
-early_stopping = EarlyStopping(
-    monitor='val_auc_pr',  # Monitor validation AUC-PR metric
-    mode='max',
-    patience=5,            # Stop training after 5 epochs with no improvement
-    restore_best_weights=True,
-    verbose=1
-)
-
-reduce_lr = ReduceLROnPlateau(
-    monitor='val_auc_pr',
-    mode='max',
-    factor=0.5,           # Reduce learning rate by half
-    patience=3,           # If no improvement for 3 epochs
-    min_lr=1e-6,
-    verbose=1
-)
-
-# Paths for saving model and weights
-full_model_path = "best_model.h5"
-weights_path = "best_model.weights.h5"
-
-# Save the full model (architecture + weights)
-model_checkpoint_full = ModelCheckpoint(
-    filepath=full_model_path,
-    monitor='val_auc_pr',
-    mode='max',
-    save_best_only=True,
-    save_weights_only=False,
-    verbose=1
-)
-
-# Save weights only
-model_checkpoint_weights = ModelCheckpoint(
-    filepath=weights_path,
-    monitor='val_auc_pr',
-    mode='max',
-    save_best_only=True,
-    save_weights_only=True,
-    verbose=1
-)
-
-# Train the model
-history = model.fit(
-    train_dataset,
-    validation_data=valid_dataset,
-    epochs=20,
-    class_weight=class_weight_dict,  # Use class weights to balance training
-    callbacks=[early_stopping, reduce_lr, model_checkpoint_weights, model_checkpoint_full],
-    verbose=2
-)
-
-# Load the best saved full model for evaluation
-best_model = tf.keras.models.load_model('best_model.h5', compile=True)
-
-# Evaluate the best model on test dataset
-test_loss, test_accuracy, test_precision, test_recall, test_auc, test_auc_pr = best_model.evaluate(test_dataset)
-
-print(f"\nBest Model Evaluation on Test Set:")
-print(f"Test Loss: {test_loss}")
-print(f"Test Accuracy: {test_accuracy}")
-print(f"Test Precision: {test_precision}")
-print(f"Test Recall: {test_recall}")
-print(f"Test AUC ROC: {test_auc}")
-print(f"Test AUC PR: {test_auc_pr}")
-
-# Plot training and validation accuracy over epochs
-plt.figure(figsize=(12, 6))
-
-plt.subplot(1, 2, 1)
-plt.plot(history.history['accuracy'], label='Train Accuracy')
-plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
-plt.title('Accuracy: Training vs Validation')
-plt.xlabel('Epochs')
-plt.ylabel('Accuracy')
-plt.legend()
-
-# Plot training and validation loss over epochs
-plt.subplot(1, 2, 2)
-plt.plot(history.history['loss'], label='Train Loss')
-plt.plot(history.history['val_loss'], label='Validation Loss')
-plt.title('Loss: Training vs Validation')
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.legend()
-
-plt.tight_layout()
-plt.show()
-
-# Predict on test dataset
-y_pred_probs = best_model.predict(test_dataset)
-# Convert probabilities to binary labels (0 or 1)
-y_pred = np.round(y_pred_probs).astype(int).flatten()
-
-# Extract true labels from test dataset
-y_true = np.concatenate([labels.numpy() for _, labels in test_dataset], axis=0).astype(int)
-
-# Compute confusion matrix
-cm = confusion_matrix(y_true, y_pred)
-
-# Display confusion matrix using sklearn's utility
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Empty', 'Occupied'])
-disp.plot(cmap=plt.cm.Blues)
-plt.title("Confusion Matrix")
-plt.show()
+    # Both classes should be represented in each dataset split.
+    if any(count == 0 for count in class_counts.values()):
+        raise ValueError(
+            f"{name} must contain examples from both classes. "
