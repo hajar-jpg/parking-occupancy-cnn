@@ -85,11 +85,117 @@ EPOCHS = 20
 AUTOTUNE = tf.data.AUTOTUNE
 
 
-# ---------------------------------------------------------------------
-# TFRecord loading and parsing
-# ---------------------------------------------------------------------
+val_pr_auc_history = history.history.get("val_pr_auc", [])
 
-def load_tfrecord_dataset(filename):
-    """Load and parse a TFRecord file containing images and labels."""
+if not val_pr_auc_history:
+    raise ValueError(
+        "Validation PR-AUC is missing from the training history."
+    )
 
-    filepath = DATASET_DIR / filename
+# Identify the epoch with the highest validation PR-AUC.
+best_epoch = int(np.argmax(val_pr_auc_history) + 1)
+best_validation_pr_auc = float(max(val_pr_auc_history))
+
+report = {
+    "experiment": "CNN with class weighting",
+    "selection_metric": "validation PR-AUC",
+    "best_epoch": best_epoch,
+    "epochs_completed": len(history.history["loss"]),
+
+    "dataset": {
+        "train_examples": train_stats["total"],
+        "validation_examples": valid_stats["total"],
+        "test_examples": test_stats["total"],
+        "train_class_counts": {
+            str(k): int(v)
+            for k, v in train_stats["class_counts"].items()
+        },
+        "validation_class_counts": {
+            str(k): int(v)
+            for k, v in valid_stats["class_counts"].items()
+        },
+        "test_class_counts": {
+            str(k): int(v)
+            for k, v in test_stats["class_counts"].items()
+        },
+    },
+
+    "class_weights": {
+        str(k): float(v)
+        for k, v in class_weights.items()
+    },
+
+    "configuration": {
+        "image_shape": list(IMAGE_SHAPE),
+        "batch_size": BATCH_SIZE,
+        "maximum_epochs": EPOCHS,
+        "seed": SEED,
+        "optimizer": "AdamW",
+        "initial_learning_rate": 0.0002,
+        "weight_decay": 1e-5,
+        "global_clipnorm": 5.0,
+        "loss": "BinaryFocalCrossentropy",
+        "focal_gamma": 2.0,
+        "prediction_threshold": 0.5,
+        "augmentation": False,
+        "oversampling": False,
+        "checkpoint_selection_metric": "val_pr_auc",
+        "early_stopping_patience": 5,
+        "reduce_lr_patience": 3,
+        "minimum_learning_rate": 1e-6,
+    },
+
+    "best_validation_pr_auc": best_validation_pr_auc,
+
+    "test_metrics_keras": {
+        k: float(v)
+        for k, v in keras_test_results.items()
+    },
+
+    "test_metrics_sklearn": sklearn_test_results,
+    "confusion_matrix": cm.tolist(),
+
+    "class_labels": {
+        "0": "Less than 80% occupancy",
+        "1": "At least 80% occupancy",
+    },
+
+    "artifacts": {
+        "model": BEST_MODEL_PATH.name,
+        "confusion_matrix": CONFUSION_MATRIX_PATH.name,
+        "training_curves": TRAINING_CURVES_PATH.name,
+    },
+}
+
+# Save the report as formatted JSON.
+REPORT_PATH = OUTPUT_DIR / "class_weights_test_results.json"
+
+with REPORT_PATH.open("w", encoding="utf-8") as f:
+    json.dump(report, f, indent=2)
+
+print(f"Report saved: {REPORT_PATH}")
+print(f"Best epoch: {best_epoch}")
+print(f"Best validation PR-AUC: {best_validation_pr_auc:.6f}")
+
+# Verify that all expected output artifacts exist.
+expected_artifacts = [
+    BEST_MODEL_PATH,
+    CONFUSION_MATRIX_PATH,
+    TRAINING_CURVES_PATH,
+    REPORT_PATH,
+]
+
+print("\nArtifact verification:")
+for path in expected_artifacts:
+    status = "OK" if path.is_file() else "MISSING"
+    print(f"{status:7} {path.name}")
+
+missing_artifacts = [
+    path.name for path in expected_artifacts if not path.is_file()
+]
+
+if missing_artifacts:
+    raise FileNotFoundError(
+        f"Expected artifacts are missing: {missing_artifacts}"
+    )
+
